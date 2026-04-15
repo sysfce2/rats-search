@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.25](https://github.com/DEgITx/rats-search/compare/v2.0.24...v2.0.25) (2026-04-15)
+
+
+### 🐛 Bug Fixes
+
+
+- **ui:** Fix sorting in search form([f66f132](https://github.com/DEgITx/rats-search/commit/f66f1323e78fb6a0da54b7896cab4df22de2dd7c)) by @DEgITx
+
+
+### 📚 Documentation
+
+
+- Update CHANGELOG.md for v2.0.24([3292042](https://github.com/DEgITx/rats-search/commit/32920428a125d8570ade6c267e9eff78f72b81aa)) by @github-actions[bot]
+
+
+
+
+### 👥 Contributors
+
+
+
+- [@DEgITx](https://github.com/DEgITx) — 1 commit
+
+
+- [@github-actions[bot]](https://github.com/github-actions[bot]) — 1 commit
+
+
 ## [2.0.24](https://github.com/DEgITx/rats-search/compare/v2.0.23...v2.0.24) (2026-02-28)
 
 
