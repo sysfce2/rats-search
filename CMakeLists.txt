@@ -163,6 +163,7 @@ set(SOURCES
     src/p2pnetwork.cpp
     src/searchresultmodel.cpp
     src/torrentclient.cpp
+    src/torrentexporter.cpp
     src/manticoremanager.cpp
     src/sphinxql.cpp
     src/torrentitemdelegate.cpp
@@ -201,6 +202,7 @@ set(HEADERS
     src/p2pnetwork.h
     src/searchresultmodel.h
     src/torrentclient.h
+    src/torrentexporter.h
     src/manticoremanager.h
     src/sphinxql.h
     src/torrentitemdelegate.h

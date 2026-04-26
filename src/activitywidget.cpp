@@ -5,6 +5,10 @@
 #include <QJsonObject>
 #include <QApplication>
 #include <QFont>
+#include <QMenu>
+#include <QClipboard>
+#include <QDesktopServices>
+#include <QUrl>
 
 ActivityWidget::ActivityWidget(QWidget *parent)
     : QWidget(parent)
@@ -105,6 +109,8 @@ void ActivityWidget::setupUi()
     
     connect(torrentList_, &QListWidget::itemClicked, this, &ActivityWidget::onItemClicked);
     connect(torrentList_, &QListWidget::itemDoubleClicked, this, &ActivityWidget::onItemDoubleClicked);
+    torrentList_->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(torrentList_, &QListWidget::customContextMenuRequested, this, &ActivityWidget::onContextMenu);
     
     mainLayout->addWidget(torrentList_, 1);
 }
@@ -377,11 +383,48 @@ void ActivityWidget::onItemClicked(QListWidgetItem* item)
 void ActivityWidget::onItemDoubleClicked(QListWidgetItem* item)
 {
     if (!item) return;
-    
+
     QString hash = item->data(Qt::UserRole).toString();
     if (displayedTorrents_.contains(hash)) {
         emit torrentDoubleClicked(displayedTorrents_[hash]);
     }
+}
+
+void ActivityWidget::onContextMenu(const QPoint& pos)
+{
+    QListWidgetItem* item = torrentList_->itemAt(pos);
+    if (!item) return;
+
+    QString hash = item->data(Qt::UserRole).toString();
+    if (!displayedTorrents_.contains(hash)) return;
+    TorrentInfo torrent = displayedTorrents_[hash];
+    if (!torrent.isValid()) return;
+
+    QMenu contextMenu(this);
+
+    QAction* magnetAction = contextMenu.addAction(tr("Open Magnet Link"));
+    connect(magnetAction, &QAction::triggered, [torrent]() {
+        QDesktopServices::openUrl(QUrl(torrent.magnetLink()));
+    });
+
+    QAction* copyHashAction = contextMenu.addAction(tr("Copy Info Hash"));
+    connect(copyHashAction, &QAction::triggered, [torrent]() {
+        QApplication::clipboard()->setText(torrent.hash);
+    });
+
+    QAction* copyMagnetAction = contextMenu.addAction(tr("Copy Magnet Link"));
+    connect(copyMagnetAction, &QAction::triggered, [torrent]() {
+        QApplication::clipboard()->setText(torrent.magnetLink());
+    });
+
+    contextMenu.addSeparator();
+
+    QAction* exportAction = contextMenu.addAction(tr("💾 Export to .torrent file..."));
+    connect(exportAction, &QAction::triggered, [this, torrent]() {
+        emit exportTorrentRequested(torrent);
+    });
+
+    contextMenu.exec(torrentList_->viewport()->mapToGlobal(pos));
 }
 
 QString ActivityWidget::formatSize(qint64 bytes) const

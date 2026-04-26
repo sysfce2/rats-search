@@ -38,6 +38,7 @@ signals:
     void torrentSelected(const TorrentInfo& torrent);
     void torrentDoubleClicked(const TorrentInfo& torrent);
     void removeFromFavoritesRequested(const QString& hash);
+    void exportTorrentRequested(const TorrentInfo& torrent);
 
 public slots:
     void refresh();

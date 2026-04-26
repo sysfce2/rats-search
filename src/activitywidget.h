@@ -50,6 +50,7 @@ public:
 signals:
     void torrentSelected(const TorrentInfo& torrent);
     void torrentDoubleClicked(const TorrentInfo& torrent);
+    void exportTorrentRequested(const TorrentInfo& torrent);
     void navigateToTop();  // Emitted when Top button is clicked
 
 public slots:
@@ -68,6 +69,7 @@ private slots:
     void updateQueueCounter();
     void onItemClicked(QListWidgetItem* item);
     void onItemDoubleClicked(QListWidgetItem* item);
+    void onContextMenu(const QPoint& pos);
 
 private:
     void setupUi();

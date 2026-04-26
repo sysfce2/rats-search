@@ -4,6 +4,11 @@
 #include <QHeaderView>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QMenu>
+#include <QClipboard>
+#include <QApplication>
+#include <QDesktopServices>
+#include <QUrl>
 #include <algorithm>
 
 TopTorrentsWidget::TopTorrentsWidget(QWidget *parent)
@@ -106,7 +111,8 @@ void TopTorrentsWidget::setupUi()
     tableView_->setEditTriggers(QAbstractItemView::NoEditTriggers);
     tableView_->setShowGrid(false);
     tableView_->setMouseTracking(true);
-    
+    tableView_->setContextMenuPolicy(Qt::CustomContextMenu);
+
     // Column widths
     tableView_->setColumnWidth(0, 500);  // Name
     tableView_->setColumnWidth(1, 100);  // Size
@@ -119,7 +125,8 @@ void TopTorrentsWidget::setupUi()
                 onTorrentSelected(current);
             });
     connect(tableView_, &QTableView::doubleClicked, this, &TopTorrentsWidget::onTorrentDoubleClicked);
-    
+    connect(tableView_, &QTableView::customContextMenuRequested, this, &TopTorrentsWidget::onContextMenu);
+
     mainLayout->addWidget(tableView_, 1);
     
     // More button
@@ -225,6 +232,41 @@ void TopTorrentsWidget::onTorrentDoubleClicked(const QModelIndex& index)
 void TopTorrentsWidget::onMoreTorrentsClicked()
 {
     loadTopTorrents(currentCategory_, currentTime_);
+}
+
+void TopTorrentsWidget::onContextMenu(const QPoint& pos)
+{
+    QModelIndex index = tableView_->indexAt(pos);
+    if (!index.isValid()) return;
+
+    TorrentInfo torrent = model_->getTorrent(index.row());
+    if (!torrent.isValid()) return;
+
+    QMenu contextMenu(this);
+
+    QAction* magnetAction = contextMenu.addAction(tr("Open Magnet Link"));
+    connect(magnetAction, &QAction::triggered, [torrent]() {
+        QDesktopServices::openUrl(QUrl(torrent.magnetLink()));
+    });
+
+    QAction* copyHashAction = contextMenu.addAction(tr("Copy Info Hash"));
+    connect(copyHashAction, &QAction::triggered, [torrent]() {
+        QApplication::clipboard()->setText(torrent.hash);
+    });
+
+    QAction* copyMagnetAction = contextMenu.addAction(tr("Copy Magnet Link"));
+    connect(copyMagnetAction, &QAction::triggered, [torrent]() {
+        QApplication::clipboard()->setText(torrent.magnetLink());
+    });
+
+    contextMenu.addSeparator();
+
+    QAction* exportAction = contextMenu.addAction(tr("💾 Export to .torrent file..."));
+    connect(exportAction, &QAction::triggered, [this, torrent]() {
+        emit exportTorrentRequested(torrent);
+    });
+
+    contextMenu.exec(tableView_->viewport()->mapToGlobal(pos));
 }
 
 void TopTorrentsWidget::loadTopTorrents(const QString& category, const QString& time)

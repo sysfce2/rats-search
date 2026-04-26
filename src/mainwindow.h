@@ -24,6 +24,7 @@ class ApiServer;
 class UpdateManager;
 class MigrationManager;
 class FavoritesManager;
+class TorrentExporter;
 
 // UI components
 class QLineEdit;
@@ -125,6 +126,7 @@ private:
     // Torrent detail / action helpers (used by multiple tabs)
     void showTorrentDetails(const TorrentInfo& torrent);
     void openMagnetLink(const TorrentInfo& torrent);
+    void exportTorrentToFile(const TorrentInfo& torrent);
 
     // P2P Connection state for status indicator
     enum class P2PState {
@@ -173,6 +175,7 @@ private:
     std::unique_ptr<UpdateManager> updateManager;
     std::unique_ptr<MigrationManager> migrationManager;
     std::unique_ptr<FavoritesManager> favoritesManager;
+    std::unique_ptr<TorrentExporter> torrentExporter_;
     
     // Models and Delegates
     SearchResultModel *searchResultModel;

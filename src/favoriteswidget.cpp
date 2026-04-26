@@ -186,14 +186,21 @@ void FavoritesWidget::onContextMenu(const QPoint& pos)
     if (!torrent.isValid()) return;
     
     QMenu contextMenu(this);
-    
+
     QAction* removeAction = contextMenu.addAction(tr("❌ Remove from Favorites"));
     connect(removeAction, &QAction::triggered, [this, torrent]() {
         if (favoritesManager_) {
             favoritesManager_->removeFavorite(torrent.hash);
         }
     });
-    
+
+    contextMenu.addSeparator();
+
+    QAction* exportAction = contextMenu.addAction(tr("💾 Export to .torrent file..."));
+    connect(exportAction, &QAction::triggered, [this, torrent]() {
+        emit exportTorrentRequested(torrent);
+    });
+
     contextMenu.exec(tableView_->viewport()->mapToGlobal(pos));
 }
 

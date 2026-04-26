@@ -16,6 +16,7 @@
 #include "activitywidget.h"
 #include "favoriteswidget.h"
 #include "favoritesmanager.h"
+#include "torrentexporter.h"
 
 // New API layer
 #include "api/ratsapi.h"
@@ -131,6 +132,14 @@ MainWindow::MainWindow(int p2pPort, int dhtPort, const QString& dataDirectory, Q
     migrationManager = std::make_unique<MigrationManager>(dataDirectory_, this);
     favoritesManager = std::make_unique<FavoritesManager>(dataDirectory_, this);
     favoritesManager->load();
+    torrentExporter_ = std::make_unique<TorrentExporter>(this);
+    torrentExporter_->setDataDirectory(dataDirectory_);
+    torrentExporter_->setP2PNetwork(p2pNetwork.get());
+    torrentExporter_->setDatabase(torrentDatabase.get());
+    connect(torrentExporter_.get(), &TorrentExporter::statusMessage,
+            this, [this](const QString& msg, int timeout) {
+                statusBar()->showMessage(msg, timeout);
+            });
     qInfo() << "Object creation took:" << (startupTimer.elapsed() - objectsStart) << "ms";
     
     qInfo() << "MainWindow constructor (before deferred init):" << startupTimer.elapsed() << "ms";
@@ -430,21 +439,29 @@ void MainWindow::connectTabSignals()
             this, &MainWindow::showTorrentDetails);
     connect(topTorrentsWidget, &TopTorrentsWidget::torrentDoubleClicked,
             this, &MainWindow::openMagnetLink);
-    
+    connect(topTorrentsWidget, &TopTorrentsWidget::exportTorrentRequested,
+            this, &MainWindow::exportTorrentToFile);
+
     connect(feedWidget, &FeedWidget::torrentSelected,
             this, &MainWindow::showTorrentDetails);
     connect(feedWidget, &FeedWidget::torrentDoubleClicked,
             this, &MainWindow::openMagnetLink);
-    
+    connect(feedWidget, &FeedWidget::exportTorrentRequested,
+            this, &MainWindow::exportTorrentToFile);
+
     connect(activityWidget, &ActivityWidget::torrentSelected,
             this, &MainWindow::showTorrentDetails);
     connect(activityWidget, &ActivityWidget::torrentDoubleClicked,
             this, &MainWindow::openMagnetLink);
-    
+    connect(activityWidget, &ActivityWidget::exportTorrentRequested,
+            this, &MainWindow::exportTorrentToFile);
+
     connect(favoritesWidget, &FavoritesWidget::torrentSelected,
             this, &MainWindow::showTorrentDetails);
     connect(favoritesWidget, &FavoritesWidget::torrentDoubleClicked,
             this, &MainWindow::openMagnetLink);
+    connect(favoritesWidget, &FavoritesWidget::exportTorrentRequested,
+            this, &MainWindow::exportTorrentToFile);
 }
 
 void MainWindow::connectDetailsSignals()
@@ -1325,13 +1342,26 @@ void MainWindow::showTorrentContextMenu(const QPoint &pos)
     }
     
     contextMenu.addSeparator();
-    
+
+    QAction *exportAction = contextMenu.addAction(tr("💾 Export to .torrent file..."));
+    connect(exportAction, &QAction::triggered, [this, torrent]() {
+        exportTorrentToFile(torrent);
+    });
+
     QAction *detailsAction = contextMenu.addAction(tr("Show Details"));
     connect(detailsAction, &QAction::triggered, [this, index]() {
         onTorrentSelected(index);
     });
-    
+
     contextMenu.exec(resultsTableView->viewport()->mapToGlobal(pos));
+}
+
+void MainWindow::exportTorrentToFile(const TorrentInfo& torrent)
+{
+    if (!torrentExporter_) {
+        return;
+    }
+    torrentExporter_->exportTorrent(this, torrent);
 }
 
 void MainWindow::onP2PStatusChanged(const QString &status)

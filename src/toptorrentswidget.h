@@ -65,6 +65,7 @@ public:
 signals:
     void torrentSelected(const TorrentInfo& torrent);
     void torrentDoubleClicked(const TorrentInfo& torrent);
+    void exportTorrentRequested(const TorrentInfo& torrent);
 
 public slots:
     void refresh();
@@ -76,6 +77,7 @@ private slots:
     void onTorrentSelected(const QModelIndex& index);
     void onTorrentDoubleClicked(const QModelIndex& index);
     void onMoreTorrentsClicked();
+    void onContextMenu(const QPoint& pos);
 
 private:
     void setupUi();
