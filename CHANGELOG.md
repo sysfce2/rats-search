@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.26](https://github.com/DEgITx/rats-search/compare/v2.0.25...v2.0.26) (2026-04-26)
+
+
+### 🐛 Bug Fixes
+
+
+- **core:** Fix manticore statup detection #273 #244([9c7adb5](https://github.com/DEgITx/rats-search/commit/9c7adb55251b9823be68f15419ba3e71c105de82)) by @DEgITx
+
+
+### 📚 Documentation
+
+
+- Update CHANGELOG.md for v2.0.25([7d0c8b3](https://github.com/DEgITx/rats-search/commit/7d0c8b326b98fb94037570dcc7b01dee29033eb6)) by @github-actions[bot]
+
+
+### 🚀 Features
+
+
+- **export:** Export any .torrent file #268([4b87acf](https://github.com/DEgITx/rats-search/commit/4b87acf7c0abf9e5d31bab6d65899ed733a65200)) by @DEgITx
+- **core:** Clever db timer([2478171](https://github.com/DEgITx/rats-search/commit/2478171d78de78a41f568d89c0c65024bf1463bd)) by @DEgITx
+
+
+
+
+### 👥 Contributors
+
+
+
+- [@DEgITx](https://github.com/DEgITx) — 3 commits
+
+
+- [@github-actions[bot]](https://github.com/github-actions[bot]) — 1 commit
+
+
 ## [2.0.25](https://github.com/DEgITx/rats-search/compare/v2.0.24...v2.0.25) (2026-04-15)
 
 
