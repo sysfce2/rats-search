@@ -110,6 +110,24 @@ private:
     bool isPortAvailable(int port);
     int findAvailablePort(int startPort, int maxAttempts = 10);
 
+    /**
+     * @brief Compute total size of the Manticore database directory in bytes.
+     * @return Size in bytes, or 0 if directory doesn't exist / on error.
+     */
+    qint64 computeDatabaseSizeBytes() const;
+
+    /**
+     * @brief Calculate a startup timeout proportional to the database size.
+     *
+     * Manticore needs to precache every RT table on startup; the bigger the
+     * on-disk data, the longer it takes before `searchd` starts accepting
+     * connections. Base timeout is used for empty/small databases; for larger
+     * ones additional milliseconds are added per MB of data.
+     *
+     * @return Timeout in milliseconds, clamped between a sane min and max.
+     */
+    int computeStartupTimeoutMs() const;
+
     QString dataDirectory_;
     QString databasePath_;
     QString configPath_;

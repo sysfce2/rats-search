@@ -13,6 +13,8 @@
 #include <QTcpServer>
 #include <QEventLoop>
 #include <QPointer>
+#include <QDirIterator>
+#include <QFileInfo>
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -202,10 +204,14 @@ bool ManticoreManager::start()
     }
     qInfo() << "Process start took:" << (startupTimer.elapsed() - processStart) << "ms";
     
-    // Wait for ready with optimized polling
+    // Wait for ready with optimized polling.
+    // Timeout scales with database size — bigger databases take longer to
+    // precache on startup before searchd accepts connections.
     qint64 waitStart = startupTimer.elapsed();
-    bool ready = waitForReady(30000);
-    qInfo() << "waitForReady took:" << (startupTimer.elapsed() - waitStart) << "ms";
+    const int readyTimeoutMs = computeStartupTimeoutMs();
+    bool ready = waitForReady(readyTimeoutMs);
+    qInfo() << "waitForReady took:" << (startupTimer.elapsed() - waitStart) << "ms"
+            << "(timeout was" << readyTimeoutMs << "ms)";
     qInfo() << "Total Manticore startup:" << startupTimer.elapsed() << "ms";
     
     return ready;
@@ -734,4 +740,54 @@ int ManticoreManager::findAvailablePort(int startPort, int maxAttempts)
         }
     }
     return -1;  // No available port found
+}
+
+qint64 ManticoreManager::computeDatabaseSizeBytes() const
+{
+    QFileInfo rootInfo(databasePath_);
+    if (!rootInfo.exists() || !rootInfo.isDir()) {
+        return 0;
+    }
+
+    qint64 total = 0;
+    QDirIterator it(databasePath_,
+                    QDir::Files | QDir::NoSymLinks | QDir::NoDotAndDotDot | QDir::Hidden,
+                    QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        it.next();
+        const QFileInfo fi = it.fileInfo();
+        if (fi.isFile()) {
+            total += fi.size();
+        }
+    }
+    return total;
+}
+
+int ManticoreManager::computeStartupTimeoutMs() const
+{
+    // Tunable constants.
+    //
+    // Base is what an empty Manticore instance needs to come up. Per-MB is
+    // a rough estimate of how much precaching slows down initial startup on
+    // a typical SSD. Cap prevents pathological waits if the data directory
+    // happens to be huge or on slow storage.
+    constexpr int baseTimeoutMs = 30 * 1000;          // 30 s
+    constexpr int minTimeoutMs = 30 * 1000;           // never wait less
+    constexpr int maxTimeoutMs = 10 * 60 * 1000;      // 10 min cap
+    constexpr double msPerMB = 100.0;                  // +100 ms per MB of data
+
+    const qint64 sizeBytes = computeDatabaseSizeBytes();
+    const double sizeMB = static_cast<double>(sizeBytes) / (1024.0 * 1024.0);
+
+    const double extraMs = sizeMB * msPerMB;
+    qint64 timeoutMs = static_cast<qint64>(baseTimeoutMs) + static_cast<qint64>(extraMs);
+
+    if (timeoutMs < minTimeoutMs) timeoutMs = minTimeoutMs;
+    if (timeoutMs > maxTimeoutMs) timeoutMs = maxTimeoutMs;
+
+    qInfo().nospace() << "Manticore startup timeout: " << timeoutMs
+                      << " ms (database size: "
+                      << QString::number(sizeMB, 'f', 2) << " MB)";
+
+    return static_cast<int>(timeoutMs);
 }
