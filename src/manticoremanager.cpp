@@ -11,6 +11,8 @@
 #include <QRegularExpression>
 #include <QElapsedTimer>
 #include <QTcpServer>
+#include <QEventLoop>
+#include <QPointer>
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -200,14 +202,6 @@ bool ManticoreManager::start()
     }
     qInfo() << "Process start took:" << (startupTimer.elapsed() - processStart) << "ms";
     
-#ifdef Q_OS_WIN
-    // On Windows, the process forks into background immediately
-    // Don't wait for full finish - just give it a moment to fork
-    // The actual readiness will be detected in waitForReady()
-    process_->waitForFinished(100);  // Reduced from 3000ms to 100ms
-    qInfo() << "Windows daemon mode: searchd forking to background";
-#endif
-    
     // Wait for ready with optimized polling
     qint64 waitStart = startupTimer.elapsed();
     bool ready = waitForReady(30000);
@@ -313,10 +307,22 @@ bool ManticoreManager::waitForReady(int timeoutMs)
     
     // Start with fast polling, then slow down
     int checkInterval = 50;  // Start with 50ms checks for fast startup detection
+    int lastProgressLogSec = 0;
     
     qInfo() << "Waiting for Manticore to become ready...";
     
+    QPointer<ManticoreManager> self(this);
+    
     while (timer.elapsed() < timeoutMs) {
+        // Pump the event loop so that QProcess::readyReadStandard{Output,Error}
+        // signals are delivered to onProcessReadyRead() and Manticore's log
+        // messages are emitted in real time (in parallel with connection checks),
+        // instead of being buffered until this function returns.
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+        if (!self) {
+            return false; // destroyed while waiting
+        }
+        
         // Check PID file first (faster than network connection)
         bool pidExists = QFile::exists(pidFilePath_);
         
@@ -325,12 +331,29 @@ bool ManticoreManager::waitForReady(int timeoutMs)
             emit started();
             qInfo() << "Manticore is ready on port" << port_ << "(took" << timer.elapsed() << "ms)";
             
+            // Flush any remaining output from the process before returning
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+            
             // Start connection monitoring
             connectionCheckTimer_->start();
             return true;
         }
         
-        QThread::msleep(checkInterval);
+        // Event-loop-friendly sleep: keep processing events (including
+        // QProcess ready-read signals) while we wait for the next check.
+        // This replaces QThread::msleep() which would block the event loop
+        // and cause Manticore log output to be flushed only at the end.
+        {
+            QEventLoop waitLoop;
+            QTimer sleepTimer;
+            sleepTimer.setSingleShot(true);
+            QObject::connect(&sleepTimer, &QTimer::timeout, &waitLoop, &QEventLoop::quit);
+            sleepTimer.start(checkInterval);
+            waitLoop.exec();
+        }
+        if (!self) {
+            return false;
+        }
         
         // Increase interval after first second to reduce CPU usage
         if (timer.elapsed() > 1000 && checkInterval < 200) {
@@ -356,8 +379,10 @@ bool ManticoreManager::waitForReady(int timeoutMs)
         }
         
         // Log progress every 5 seconds
-        if (timer.elapsed() > 0 && (timer.elapsed() / 1000) % 5 == 0 && timer.elapsed() % 1000 < checkInterval) {
-            qInfo() << "Still waiting for Manticore..." << (timer.elapsed() / 1000) << "seconds elapsed";
+        int elapsedSec = static_cast<int>(timer.elapsed() / 1000);
+        if (elapsedSec > 0 && elapsedSec != lastProgressLogSec && elapsedSec % 5 == 0) {
+            qInfo() << "Still waiting for Manticore..." << elapsedSec << "seconds elapsed";
+            lastProgressLogSec = elapsedSec;
         }
     }
     
