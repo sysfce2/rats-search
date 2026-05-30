@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: ${{ github.head_ref != '' }}
 
 env:
-  QT_VERSION: '6.10.1'
+  QT_VERSION: '6.10.3'
   BUILD_TYPE: Release
 
 jobs:
