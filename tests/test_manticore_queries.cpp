@@ -1,968 +1,761 @@
 /**
  * @file test_manticore_queries.cpp
- * @brief Integration test that starts Manticore and verifies all query types used in the application
- * 
- * This test starts a real Manticore Search instance and runs all the query patterns
- * used throughout the application to verify their SphinxQL syntax is correct.
- * 
- * Requires: searchd executable accessible via the standard import paths
+ * @brief Integration test that starts a real Manticore instance and drives the
+ *        new data layer (rats::data::Manticore + Database + TorrentRepository).
+ *
+ * Verifies the end-to-end CRUD / search / statistics path against a live
+ * searchd, replacing the old raw-SphinxQL query test. Requires the bundled
+ * searchd executable to be discoverable via the standard import paths.
  */
 
-#include <QtTest/QtTest>
-#include <QTemporaryDir>
-#include <QJsonDocument>
+#include <QDir>
+#include <QFileInfo>
 #include <QJsonObject>
-#include <QJsonArray>
-#include <QDateTime>
-#include "manticoremanager.h"
-#include "sphinxql.h"
+#include <QSet>
+#include <QTemporaryDir>
+#include <QThread>
+#include <QtTest/QtTest>
 
-class TestManticoreQueries : public QObject
-{
+#include "data/database.h"
+#include "data/manticore.h"
+#include "data/query.h"
+#include "data/row_id.h"
+#include "data/torrent_repository.h"
+#include "domain/content.h"
+#include "domain/torrent.h"
+#include "services/database_dump.h"
+#include "services/database_exporter.h"
+#include "services/database_importer.h"
+#include "services/filter_policy.h"
+#include "services/indexing_service.h"
+
+using rats::data::Database;
+using rats::data::Manticore;
+using rats::data::SelectQuery;
+using rats::data::TorrentRepository;
+using rats::domain::ContentCategory;
+using rats::domain::ContentType;
+using rats::domain::File;
+using rats::domain::Torrent;
+
+class TestManticoreQueries : public QObject {
     Q_OBJECT
 
 private slots:
     void initTestCase();
     void cleanupTestCase();
 
-    // ========================================================================
-    // Connection & Status
-    // ========================================================================
-    void testShowStatus();
-    void testIsConnected();
+    void testConnected();
+    void testAddAndGet();
+    void testExists();
+    void testGetWithFiles();
+    void testSearchByName();
+    void testSearchByHash();
+    void testUpdateTrackerCounts();
+    void testStatistics();
+    void testRecent();
+    void testTop();
+    void testRemove();
+    void testSelectQueryAgainstLiveIndex();
+    void testPageAfterIdWalksPastMaxMatches();
+    void testRowIdIsDerivedFromHash();
+    void testFilesRowSharesTheTorrentId();
+    void testReAddDoesNotDuplicateRow();
+    void testRowIdCollisionIsRefused();
+    void testBatchRowIdCollisionIsRefused();
+    void testBatchDuplicateHashCollapsesToOneRow();
+    void testMigrationReKeysLegacyRows();
+    void testUpdateAppliesAndKeepsSearchable();
 
-    // ========================================================================
-    // Internal of fields
-    // ========================================================================
-    void testIsFieldReady();
-
-    // ========================================================================
-    // INSERT operations (torrents, files, feed, version, store)
-    // ========================================================================
-    void testInsertTorrent();
-    void testInsertFiles();
-    void testInsertFeedItem();
-    void testInsertVersionRecord();
-    void testInsertStoreRecord();
-
-    // ========================================================================
-    // SELECT / read operations
-    // ========================================================================
-    void testSelectAllTorrents();
-    void testSelectTorrentByHash();
-    void testSelectTorrentById();
-    void testSelectIdByHash();
-    void testSelectSpecificColumns();
-    void testSelectInfoByHash();
-    void testSelectMaxId();
-    void testSelectCount();
-    void testSelectCountWithWhere();
-    void testSelectAggregation();
-    void testSelectOrderByDesc();
-    void testSelectOrderByAsc();
-    void testSelectWithOffsetLimit();
-    void testSelectTopTorrents();
-    void testSelectTopTorrentsWithTimeFilter();
-    void testSelectTopTorrentsWithTypeFilter();
-    void testSelectRandomTorrents();
-    void testSelectWithInClause();
-    void testSelectFilesFromFiles();
-    void testSelectFromFeed();
-    void testSelectPaginatedById();
-    void testSelectContentTypeMigrationQuery();
-
-    // ========================================================================
-    // Full-text MATCH search
-    // ========================================================================
-    void testMatchSearch();
-    void testMatchSearchWithFilters();
-    void testMatchSearchWithOrderAndLimit();
-    void testMatchFileSearch();
-    void testMatchFileSearchWithSnippet();
-
-    // ========================================================================
-    // Data integrity verification (from legacy speed.txt tests)
-    // ========================================================================
-    void testInsertFilesAndVerifyFields();
-    void testSearchFilesAndVerifyFields();
-    void testBulkInsertFeedAndCount();
-    void testInsertFeedJsonAndVerifyReadback();
-
-    // ========================================================================
-    // REPLACE operations
-    // ========================================================================
-    void testReplaceIntoStore();
-
-    // ========================================================================
-    // UPDATE operations
-    // ========================================================================
-    void testUpdateTorrentByHash();
-    void testUpdateTrackerInfo();
-    void testUpdateContentType();
-    void testUpdateInfoField();
-
-    // ========================================================================
-    // DELETE operations
-    // ========================================================================
-    void testDeleteTorrentByHash();
-    void testDeleteFilesByHash();
-    void testDeleteFeedAll();
-
-    // ========================================================================
-    // Maintenance operations
-    // ========================================================================
-    void testOptimizeIndex();
-    void testFlushRamchunk();
-    void testTruncateTable();
-
-    // ========================================================================
-    // SphinxQL helper methods
-    // ========================================================================
-    void testInsertValues();
-    void testReplaceValues();
-    void testUpdateValues();
-    void testDeleteFrom();
-    void testGetMaxId();
-    void testGetCount();
+    void testExportImportRoundTrip();
+    void testImportIsAMergeNotADuplicate();
+    void testCancelledExportLeavesNoFile();
+    void testInterruptedImportResumesWhereItStopped();
 
 private:
-    // Helper to insert a test torrent with given parameters
-    bool insertTestTorrent(qint64 id, const QString& hash, const QString& name,
-                           qint64 size = 1024*1024, int files = 1, int seeders = 10,
-                           int contentType = 1, int contentCategory = 0);
-    
-    // Helper to insert a test file record
-    bool insertTestFiles(qint64 id, const QString& hash, const QString& path, const QString& sizeStr);
-    SphinxQL::Results queryUntilFieldReady(
-        const QString& sql, const QVariantList& params,
-        const QString& field, int maxRetries = 10, int delayMs = 10);
+    // Build a valid torrent with a distinct 40-hex hash derived from `n`.
+    Torrent makeTorrent(
+        int n, const QString& name, ContentType type = ContentType::Video, qint64 size = 1024 * 1024, int seeders = 10);
+    // Poll get() until the RT row is visible (RT attributes settle asynchronously).
+    bool waitForTorrent(const QString& hash, int maxRetries = 50, int delayMs = 20);
+    // Same, for the files row. The two tables settle independently, so a
+    // torrent being visible says nothing about its file list yet.
+    bool waitForFiles(const QString& hash, int expected, int maxRetries = 50, int delayMs = 20);
 
-    QTemporaryDir *tempDir_ = nullptr;
-    ManticoreManager *manager_ = nullptr;
-    SphinxQL *sphinxql_ = nullptr;
+    QTemporaryDir* tempDir_ = nullptr;
+    Manticore* manticore_ = nullptr;
+    Database* db_ = nullptr;
+    TorrentRepository* repo_ = nullptr;
+    rats::service::FilterPolicy* filter_ = nullptr;
+    rats::service::IndexingService* indexing_ = nullptr;
 };
 
-SphinxQL::Results TestManticoreQueries::queryUntilFieldReady(
-    const QString& sql, const QVariantList& params,
-    const QString& field, int maxRetries, int delayMs)
+Torrent TestManticoreQueries::makeTorrent(int n, const QString& name, ContentType type, qint64 size, int seeders)
 {
-    for (int attempt = 0; attempt < maxRetries; ++attempt) {
-        auto results = sphinxql_->query(sql, params);
-        if (!results.isEmpty() && results[0].contains(field)
-            && results[0][field].isValid() && !results[0][field].toString().isEmpty()) {
-            if (attempt > 0)
-                qInfo() << "RT attribute" << field << "became ready after" << attempt
-                        << "retries (" << (attempt * delayMs) << "ms)";
-            return results;
-        }
+    Torrent t;
+    // 40-char hex hash: an 8-hex prefix from n, padded with 'a'.
+    t.hash = QString("%1").arg(n, 8, 16, QChar('0')) + QString(32, 'a');
+    t.name = name;
+    t.size = size;
+    t.files = 1;
+    t.pieceLength = 262144;
+    t.added = QDateTime::currentDateTime();
+    t.ipv4 = "192.168.1.1";
+    t.port = 6881;
+    t.contentType = type;
+    t.contentCategory = ContentCategory::Unknown;
+    t.seeders = seeders;
+    t.leechers = 5;
+    t.completed = 100;
+    return t;
+}
+
+bool TestManticoreQueries::waitForTorrent(const QString& hash, int maxRetries, int delayMs)
+{
+    for (int i = 0; i < maxRetries; ++i) {
+        if (repo_->exists(hash))
+            return true;
         QThread::msleep(delayMs);
     }
-    // Return last attempt even if still empty — test will fail with clear assertion
-    return sphinxql_->query(sql, params);
+    return repo_->exists(hash);
+}
+
+bool TestManticoreQueries::waitForFiles(const QString& hash, int expected, int maxRetries, int delayMs)
+{
+    // exists() only asks the torrents table. A file list is a row in `files`,
+    // written by a separate statement and made visible by the RT index on its own
+    // schedule, so waiting for the torrent says nothing about its files yet.
+    for (int i = 0; i < maxRetries; ++i) {
+        if (repo_->filesOf(hash).size() == expected)
+            return true;
+        QThread::msleep(delayMs);
+    }
+    return repo_->filesOf(hash).size() == expected;
 }
 
 void TestManticoreQueries::initTestCase()
 {
-    // Create temporary directory for Manticore data
     tempDir_ = new QTemporaryDir();
     QVERIFY2(tempDir_->isValid(), "Failed to create temporary directory");
-    
     qInfo() << "Test data directory:" << tempDir_->path();
-    
-    // Start Manticore
-    manager_ = new ManticoreManager(tempDir_->path());
-    
-    bool started = manager_->start();
+
+    manticore_ = new Manticore(tempDir_->path());
+    const bool started = manticore_->start();
     QVERIFY2(started, "Failed to start Manticore Search. Is searchd available?");
-    QVERIFY(manager_->isRunning());
-    
-    // Create SphinxQL interface
-    sphinxql_ = new SphinxQL(manager_);
-    QVERIFY(sphinxql_->isConnected());
-    
-    qInfo() << "Manticore started successfully on port" << manager_->port();
+    QVERIFY(manticore_->isRunning());
+    qInfo() << "Manticore started on port" << manticore_->port();
+
+    db_ = new Database(manticore_);
+    QVERIFY(db_->isConnected());
+
+    repo_ = new TorrentRepository(db_);
+    repo_->primeFromDatabase();
+
+    filter_ = new rats::service::FilterPolicy();
+    indexing_ = new rats::service::IndexingService(repo_, filter_);
 }
 
 void TestManticoreQueries::cleanupTestCase()
 {
-    delete sphinxql_;
-    sphinxql_ = nullptr;
-    
-    if (manager_) {
-        manager_->stop();
-        delete manager_;
-        manager_ = nullptr;
+    delete indexing_;
+    indexing_ = nullptr;
+    delete filter_;
+    filter_ = nullptr;
+    delete repo_;
+    repo_ = nullptr;
+    delete db_;
+    db_ = nullptr;
+    if (manticore_) {
+        manticore_->stop();
+        delete manticore_;
+        manticore_ = nullptr;
     }
-    
     delete tempDir_;
     tempDir_ = nullptr;
 }
 
-// ============================================================================
-// Helpers
-// ============================================================================
-
-bool TestManticoreQueries::insertTestTorrent(qint64 id, const QString& hash,
-                                              const QString& name, qint64 size,
-                                              int files, int seeders,
-                                              int contentType, int contentCategory)
+void TestManticoreQueries::testConnected()
 {
-    QVariantMap values;
-    values["id"] = id;
-    values["hash"] = hash;
-    values["name"] = name;
-    values["nameIndex"] = name;
-    values["size"] = size;
-    values["files"] = files;
-    values["piecelength"] = 262144;
-    values["added"] = QDateTime::currentSecsSinceEpoch();
-    values["ipv4"] = QString("192.168.1.1");
-    values["port"] = 6881;
-    values["contentType"] = contentType;
-    values["contentCategory"] = contentCategory;
-    values["seeders"] = seeders;
-    values["leechers"] = 5;
-    values["completed"] = 100;
-    values["trackersChecked"] = QDateTime::currentSecsSinceEpoch();
-    values["good"] = 3;
-    values["bad"] = 0;
-    values["info"] = QString(R"({"trackers":["udp://tracker.example.com:6969"]})");
-    
-    return sphinxql_->insertValues("torrents", values);
+    QVERIFY(db_->isConnected());
+    QVERIFY(manticore_->isRunning());
 }
 
-bool TestManticoreQueries::insertTestFiles(qint64 id, const QString& hash,
-                                            const QString& path, const QString& sizeStr)
+void TestManticoreQueries::testAddAndGet()
 {
-    QVariantMap values;
-    values["id"] = id;
-    values["hash"] = hash;
-    values["path"] = path;
-    values["size"] = sizeStr;
-    
-    return sphinxql_->insertValues("files", values);
+    const Torrent t = makeTorrent(1, "Ubuntu Linux ISO", ContentType::Archive, 4LL * 1024 * 1024 * 1024, 42);
+    QVERIFY(repo_->add(t));
+    QVERIFY(waitForTorrent(t.hash));
+
+    const auto got = repo_->get(t.hash);
+    QVERIFY(got.has_value());
+    QCOMPARE(got->hash, t.hash);
+    QCOMPARE(got->name, QString("Ubuntu Linux ISO"));
+    QCOMPARE(got->size, (qint64)(4LL * 1024 * 1024 * 1024));
+    QCOMPARE(got->seeders, 42);
+    QCOMPARE(rats::domain::toId(got->contentType), rats::domain::toId(ContentType::Archive));
 }
 
-// ============================================================================
-// Connection & Status
-// ============================================================================
-
-void TestManticoreQueries::testShowStatus()
+void TestManticoreQueries::testExists()
 {
-    // Used by ManticoreManager::testConnection()
-    auto results = sphinxql_->query("SHOW STATUS");
-    QVERIFY2(!results.isEmpty(), "SHOW STATUS should return results");
+    QVERIFY(repo_->exists(makeTorrent(1, "x").hash)); // added in testAddAndGet
+    QVERIFY(!repo_->exists(QString(40, 'f'))); // never inserted
 }
 
-void TestManticoreQueries::testIsConnected()
+void TestManticoreQueries::testGetWithFiles()
 {
-    QVERIFY(sphinxql_->isConnected());
+    Torrent t = makeTorrent(2, "Multi File Pack", ContentType::Video, 2000, 5);
+    t.files = 2;
+    t.fileList.append(File { "folder/movie.mkv", 1900 });
+    t.fileList.append(File { "folder/readme.txt", 100 });
+    QVERIFY(repo_->add(t));
+    QVERIFY(waitForTorrent(t.hash));
+    QVERIFY(waitForFiles(t.hash, 2));
+
+    const auto got = repo_->get(t.hash, /*includeFiles=*/true);
+    QVERIFY(got.has_value());
+    QCOMPARE(got->fileList.size(), 2);
+    QCOMPARE(got->fileList[0].path, QString("folder/movie.mkv"));
+    QCOMPARE(got->fileList[0].size, (qint64)1900);
 }
 
-// ============================================================================
-// Internal of fields
-// ============================================================================
-void TestManticoreQueries::testIsFieldReady()
+void TestManticoreQueries::testSearchByName()
 {
-    // DESCRIBE returns one row per field with columns: Field, Type, Properties
-    auto results = sphinxql_->query("DESCRIBE files");
-    QVERIFY2(!results.isEmpty(), "DESCRIBE files returned no results");
-    
-    // Collect all field names
-    QStringList fields;
-    for (const auto& row : results) {
-        fields << row["Field"].toString();
+    QVERIFY(repo_->add(makeTorrent(3, "Debian Server Edition", ContentType::Archive)));
+    QVERIFY(waitForTorrent(makeTorrent(3, "x").hash));
+
+    TorrentRepository::SearchQuery q;
+    q.text = "Debian";
+    q.limit = 10;
+    const auto hits = repo_->searchTorrents(q);
+    bool found = false;
+    for (const auto& h : hits) {
+        if (h.torrent.name.contains("Debian"))
+            found = true;
     }
-    qInfo() << "files fields:" << fields;
-    
-    QVERIFY2(fields.contains("hash"), "Table should contain 'hash' field");
-    QVERIFY2(fields.contains("path"), "Table should contain 'path' field");
-    QVERIFY2(fields.contains("size"), "Table should contain 'size' field");
-    QVERIFY2(fields.contains("id"), "Table should contain 'id' field");
+    QVERIFY2(found, "Full-text search should find the 'Debian' torrent");
 }
 
-// ============================================================================
-// INSERT operations
-// ============================================================================
-
-void TestManticoreQueries::testInsertTorrent()
+void TestManticoreQueries::testSearchByHash()
 {
-    // Pattern from TorrentDatabase::addTorrent()
-    bool ok = insertTestTorrent(1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                                "Test Torrent - Ubuntu 24.04 ISO");
-    QVERIFY2(ok, qPrintable("INSERT torrent failed: " + sphinxql_->lastError()));
+    const Torrent t = makeTorrent(1, "x"); // Ubuntu torrent's hash
+    TorrentRepository::SearchQuery q;
+    q.text = t.hash; // a 40-hex string is treated as an exact hash lookup
+    const auto hits = repo_->searchTorrents(q);
+    QCOMPARE(hits.size(), 1);
+    QCOMPARE(hits.first().torrent.hash, t.hash);
 }
 
-void TestManticoreQueries::testInsertFiles()
+void TestManticoreQueries::testUpdateTrackerCounts()
 {
-    // Pattern from TorrentDatabase::addFilesToDatabase()
-    bool ok = insertTestFiles(1, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                              "ubuntu-24.04-desktop-amd64.iso\nREADME.txt",
-                              "4700000000\n1024");
-    QVERIFY2(ok, qPrintable("INSERT files failed: " + sphinxql_->lastError()));
+    const Torrent t = makeTorrent(1, "x");
+    QVERIFY(repo_->updateTrackerCounts(t.hash, 111, 22, 3));
+
+    const auto got = repo_->get(t.hash);
+    QVERIFY(got.has_value());
+    QCOMPARE(got->seeders, 111);
+    QCOMPARE(got->leechers, 22);
+    QCOMPARE(got->completed, 3);
 }
 
-void TestManticoreQueries::testInsertFeedItem()
+void TestManticoreQueries::testStatistics()
 {
-    // Pattern from FeedManager::save()
-    QJsonObject feedData;
-    feedData["hash"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    feedData["name"] = "Test Feed Item";
-    feedData["size"] = 1024;
-    feedData["seeders"] = 10;
-    
-    QVariantMap values;
-    values["id"] = static_cast<qint64>(1);
-    values["data"] = QString::fromUtf8(QJsonDocument(feedData).toJson(QJsonDocument::Compact));
-    
-    bool ok = sphinxql_->insertValues("feed", values);
-    QVERIFY2(ok, qPrintable("INSERT feed failed: " + sphinxql_->lastError()));
+    const auto stats = repo_->statistics();
+    // At least the three torrents added above.
+    QVERIFY2(stats.torrents >= 3, qPrintable(QString("torrents=%1").arg(stats.torrents)));
+    QVERIFY(stats.totalSize > 0);
 }
 
-void TestManticoreQueries::testInsertVersionRecord()
+void TestManticoreQueries::testRecent()
 {
-    // version table: rt_attr_uint version, rt_field versionIndex
-    QVariantMap values;
-    values["id"] = static_cast<qint64>(1);
-    values["version"] = 1;
-    values["versionIndex"] = QString("v1");
-    
-    bool ok = sphinxql_->insertValues("version", values);
-    QVERIFY2(ok, qPrintable("INSERT version failed: " + sphinxql_->lastError()));
+    const auto recent = repo_->recent(10);
+    QVERIFY(!recent.isEmpty());
 }
 
-void TestManticoreQueries::testInsertStoreRecord()
+void TestManticoreQueries::testTop()
 {
-    // store table: rt_field storeIndex, rt_attr_json data, rt_attr_string hash, rt_attr_string peerId
-    QJsonObject storeData;
-    storeData["type"] = "vote";
-    storeData["torrentHash"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    storeData["vote"] = "good";
-    
-    QVariantMap values;
-    values["id"] = static_cast<qint64>(1);
-    values["storeIndex"] = QString("vote:aaaa");
-    values["data"] = QString::fromUtf8(QJsonDocument(storeData).toJson(QJsonDocument::Compact));
-    values["hash"] = QString("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    values["peerId"] = QString("peer123");
-    
-    bool ok = sphinxql_->insertValues("store", values);
-    QVERIFY2(ok, qPrintable("INSERT store failed: " + sphinxql_->lastError()));
+    // Ubuntu torrent now has 111 seeders; it should appear in the top list.
+    const auto top = repo_->top(QString(), QString(), 0, 10);
+    QVERIFY(!top.isEmpty());
+    // Ordered by seeders descending.
+    for (int i = 1; i < top.size(); ++i)
+        QVERIFY(top[i - 1].seeders >= top[i].seeders);
 }
 
-// ============================================================================
-// SELECT / read operations
-// ============================================================================
-
-void TestManticoreQueries::testSelectAllTorrents()
+void TestManticoreQueries::testRemove()
 {
-    auto results = sphinxql_->query("SELECT * FROM torrents");
-    QVERIFY2(sphinxql_->lastError().isEmpty() || !results.isEmpty(),
-             qPrintable("SELECT * FROM torrents failed: " + sphinxql_->lastError()));
-    QVERIFY(results.size() >= 1);
-}
-
-void TestManticoreQueries::testSelectTorrentByHash()
-{
-    // Pattern from TorrentDatabase::getTorrent() and addTorrent() existence check
-    auto results = sphinxql_->query("SELECT * FROM torrents WHERE hash = ?",
-                                    {QString("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")});
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT by hash failed: " + sphinxql_->lastError()));
-    QCOMPARE(results.size(), 1);
-}
-
-void TestManticoreQueries::testSelectTorrentById()
-{
-    auto results = sphinxql_->query("SELECT * FROM torrents WHERE id = 1");
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT by id failed: " + sphinxql_->lastError()));
-    QCOMPARE(results.size(), 1);
-}
-
-void TestManticoreQueries::testSelectIdByHash()
-{
-    // Pattern from TorrentDatabase::addTorrent() - checking existence
-    auto results = sphinxql_->query("SELECT id FROM torrents WHERE hash = ?",
-                                    {QString("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")});
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT id by hash failed: " + sphinxql_->lastError()));
-    QCOMPARE(results.size(), 1);
-    QVERIFY(results[0].contains("id"));
-}
-
-void TestManticoreQueries::testSelectSpecificColumns()
-{
-    // Pattern from TorrentDatabase::removeTorrent()
-    auto results = sphinxql_->query("SELECT size, files FROM torrents WHERE hash = ?",
-                                    {QString("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")});
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT specific columns failed: " + sphinxql_->lastError()));
-    QCOMPARE(results.size(), 1);
-}
-
-void TestManticoreQueries::testSelectInfoByHash()
-{
-    // Pattern from TorrentDatabase::updateTorrentInfoField()
-    auto results = sphinxql_->query("SELECT info FROM torrents WHERE hash = ?",
-                                    {QString("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")});
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT info failed: " + sphinxql_->lastError()));
-    QCOMPARE(results.size(), 1);
-}
-
-void TestManticoreQueries::testSelectMaxId()
-{
-    // Pattern from SphinxQL::getMaxId()
-    auto results = sphinxql_->query("SELECT MAX(id) as maxid FROM torrents");
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT MAX(id) failed: " + sphinxql_->lastError()));
-    QVERIFY(!results.isEmpty());
-    QVERIFY(results[0].contains("maxid"));
-}
-
-void TestManticoreQueries::testSelectCount()
-{
-    // Pattern from SphinxQL::getCount()
-    auto results = sphinxql_->query("SELECT COUNT(*) as cnt FROM torrents");
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT COUNT(*) failed: " + sphinxql_->lastError()));
-    QVERIFY(!results.isEmpty());
-    QVERIFY(results[0]["cnt"].toLongLong() >= 1);
-}
-
-void TestManticoreQueries::testSelectCountWithWhere()
-{
-    // Pattern from MigrationManager - count torrents with contenttype = 0
-    auto results = sphinxql_->query("SELECT COUNT(*) as cnt FROM torrents WHERE contenttype = 0");
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT COUNT(*) WHERE failed: " + sphinxql_->lastError()));
-    QVERIFY(!results.isEmpty());
-}
-
-void TestManticoreQueries::testSelectAggregation()
-{
-    // Pattern from TorrentDatabase::initialize() - statistics
-    auto results = sphinxql_->query(
-        "SELECT COUNT(*) as cnt, SUM(files) as numfiles, SUM(size) as totalsize FROM torrents");
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT aggregation failed: " + sphinxql_->lastError()));
-    QVERIFY(!results.isEmpty());
-    QVERIFY(results[0].contains("cnt"));
-    QVERIFY(results[0].contains("numfiles"));
-    QVERIFY(results[0].contains("totalsize"));
-}
-
-void TestManticoreQueries::testSelectOrderByDesc()
-{
-    // Pattern from TorrentDatabase::getRecentTorrents()
-    auto results = sphinxql_->query("SELECT * FROM torrents ORDER BY added DESC LIMIT 0,10");
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT ORDER BY DESC failed: " + sphinxql_->lastError()));
-}
-
-void TestManticoreQueries::testSelectOrderByAsc()
-{
-    // Pattern used in search with ASC sort
-    auto results = sphinxql_->query("SELECT * FROM torrents ORDER BY seeders ASC LIMIT 0,10");
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT ORDER BY ASC failed: " + sphinxql_->lastError()));
-}
-
-void TestManticoreQueries::testSelectWithOffsetLimit()
-{
-    // Pattern from TorrentDatabase::searchTorrents() with pagination
-    auto results = sphinxql_->query("SELECT * FROM torrents LIMIT 0,50");
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT with LIMIT offset failed: " + sphinxql_->lastError()));
-}
-
-void TestManticoreQueries::testSelectTopTorrents()
-{
-    // Pattern from TorrentDatabase::getTopTorrents() - base query
-    int xxxCategory = 6;  // ContentCategory::XXX
-    QString sql = QString("SELECT * FROM torrents WHERE seeders > 0 AND contentCategory != %1 "
-                          "ORDER BY seeders DESC LIMIT 0,10").arg(xxxCategory);
-    auto results = sphinxql_->query(sql);
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT top torrents failed: " + sphinxql_->lastError()));
-}
-
-void TestManticoreQueries::testSelectTopTorrentsWithTimeFilter()
-{
-    // Pattern from TorrentDatabase::getTopTorrents() with time filter
-    int xxxCategory = 6;
-    qint64 cutoff = QDateTime::currentSecsSinceEpoch() - (60 * 60 * 24);  // 24h ago
-    
-    QString sql = QString("SELECT * FROM torrents WHERE seeders > 0 AND contentCategory != %1 "
-                          "AND added > %2 ORDER BY seeders DESC LIMIT 0,10")
-        .arg(xxxCategory).arg(cutoff);
-    auto results = sphinxql_->query(sql);
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT top torrents with time failed: " + sphinxql_->lastError()));
-}
-
-void TestManticoreQueries::testSelectTopTorrentsWithTypeFilter()
-{
-    // Pattern from TorrentDatabase::getTopTorrents() with content type filter
-    int xxxCategory = 6;
-    int videoType = 1;  // contentType for video
-    
-    QString sql = QString("SELECT * FROM torrents WHERE seeders > 0 AND contentCategory != %1 "
-                          "AND contentType = %2 ORDER BY seeders DESC LIMIT 0,10")
-        .arg(xxxCategory).arg(videoType);
-    auto results = sphinxql_->query(sql);
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT top torrents with type failed: " + sphinxql_->lastError()));
-}
-
-void TestManticoreQueries::testSelectRandomTorrents()
-{
-    // Pattern from TorrentDatabase::getRandomTorrents()
-    int xxxCategory = 6;
-    QString sql = QString("SELECT * FROM torrents WHERE seeders > 0 AND contentCategory != %1 "
-                          "ORDER BY RAND() LIMIT 5")
-        .arg(xxxCategory);
-    auto results = sphinxql_->query(sql);
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT RAND() failed: " + sphinxql_->lastError()));
-}
-
-void TestManticoreQueries::testSelectWithInClause()
-{
-    // Pattern from TorrentDatabase::searchFiles() - IN clause
-    QString hash1 = sphinxql_->escapeString("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    QString sql = QString("SELECT * FROM torrents WHERE hash IN(%1)").arg(hash1);
-    auto results = sphinxql_->query(sql);
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT with IN clause failed: " + sphinxql_->lastError()));
-    QCOMPARE(results.size(), 1);
-}
-
-void TestManticoreQueries::testSelectFilesFromFiles()
-{
-    // Pattern from TorrentDatabase::getFilesForTorrent()
-    auto results = sphinxql_->query("SELECT * FROM files WHERE hash = ?",
-                                    {QString("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")});
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT from files failed: " + sphinxql_->lastError()));
-    QCOMPARE(results.size(), 1);
-}
-
-void TestManticoreQueries::testSelectFromFeed()
-{
-    // Pattern from FeedManager::load()
-    auto results = sphinxql_->query("SELECT * FROM feed LIMIT 100");
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT from feed failed: " + sphinxql_->lastError()));
-    QVERIFY(results.size() >= 1);
-}
-
-void TestManticoreQueries::testSelectPaginatedById()
-{
-    // Pattern from RatsAPI replication and MigrationManager batch processing
-    QString sql = QString("SELECT * FROM torrents WHERE id > %1 ORDER BY id ASC LIMIT %2")
-        .arg(0).arg(100);
-    auto results = sphinxql_->query(sql);
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SELECT paginated by id failed: " + sphinxql_->lastError()));
-}
-
-void TestManticoreQueries::testSelectContentTypeMigrationQuery()
-{
-    // Pattern from MigrationManager::migrateContentTypeBatch()
-    QString sql = QString("SELECT id, hash, name FROM torrents "
-                          "WHERE contenttype = 0 AND id > %1 ORDER BY id ASC LIMIT %2")
-        .arg(0).arg(100);
-    auto results = sphinxql_->query(sql);
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("Migration query failed: " + sphinxql_->lastError()));
-}
-
-// ============================================================================
-// Full-text MATCH search
-// ============================================================================
-
-void TestManticoreQueries::testMatchSearch()
-{
-    // Pattern from TorrentDatabase::searchTorrents() - full text search
-    auto results = sphinxql_->query("SELECT * FROM torrents WHERE MATCH(?)",
-                                    {QString("Ubuntu")});
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("MATCH search failed: " + sphinxql_->lastError()));
-    // Should find our "Test Torrent - Ubuntu 24.04 ISO"
-    QVERIFY(results.size() >= 1);
-}
-
-void TestManticoreQueries::testMatchSearchWithFilters()
-{
-    // Pattern from TorrentDatabase::searchTorrents() with safe search and size filters
-    int xxxCategory = 6;
-    QString sql = QString("SELECT * FROM torrents WHERE MATCH(?) "
-                          "AND contentCategory != %1 "
-                          "AND size > %2 AND size < %3 AND files > %4")
-        .arg(xxxCategory).arg(0).arg(999999999999LL).arg(0);
-    auto results = sphinxql_->query(sql, {QString("Ubuntu")});
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("MATCH with filters failed: " + sphinxql_->lastError()));
-}
-
-void TestManticoreQueries::testMatchSearchWithOrderAndLimit()
-{
-    // Pattern from TorrentDatabase::searchTorrents() - full query with order and limit
-    auto results = sphinxql_->query(
-        "SELECT * FROM torrents WHERE MATCH(?) ORDER BY seeders DESC LIMIT 0,50",
-        {QString("Ubuntu")});
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("MATCH with order/limit failed: " + sphinxql_->lastError()));
-}
-
-void TestManticoreQueries::testMatchFileSearch()
-{
-    // Pattern from TorrentDatabase::searchFiles() - search in files
-    auto results = sphinxql_->query("SELECT * FROM files WHERE MATCH(?) LIMIT 0,50",
-                                    {QString("ubuntu")});
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("MATCH files search failed: " + sphinxql_->lastError()));
-}
-
-void TestManticoreQueries::testMatchFileSearchWithSnippet()
-{
-    // Pattern from TorrentDatabase::searchFiles() - SNIPPET function
-    QString sql = "SELECT *, SNIPPET(path, ?, 'around=100', 'force_all_words=1') as snipplet "
-                  "FROM files WHERE MATCH(?) LIMIT ?,?";
-    auto results = sphinxql_->query(sql, {QString("ubuntu"), QString("ubuntu"), 0, 50});
-    QVERIFY2(sphinxql_->lastError().isEmpty(),
-             qPrintable("SNIPPET search failed: " + sphinxql_->lastError()));
-}
-
-// ============================================================================
-// Data integrity verification (from legacy speed.txt tests)
-// ============================================================================
-
-void TestManticoreQueries::testInsertFilesAndVerifyFields()
-{
-    // Legacy test: insert into files, then select by hash and verify field values
-    insertTestFiles(100, "dddddddddddddddddddddddddddddddddddddd", "bashaa", "50");
-    insertTestFiles(101, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "biotu", "30");
-
-    auto results = sphinxql_->query("SELECT * FROM files WHERE hash = ?",
-                                    {QString("dddddddddddddddddddddddddddddddddddddd")});
-    QVERIFY2(!results.isEmpty(), "Should find inserted file record");
-    QCOMPARE(results.size(), 1);
-    QCOMPARE(results[0]["size"].toString(), QString("50"));
-}
-
-void TestManticoreQueries::testSearchFilesAndVerifyFields()
-{
-    // Legacy test: MATCH search in files and verify returned hash/size
-    auto results = sphinxql_->query("SELECT * FROM files WHERE MATCH(?)",
-                                    {QString("bashaa")});
-    QVERIFY2(!results.isEmpty(), "MATCH search should find 'bashaa'");
-    QCOMPARE(results.size(), 1);
-// windows is not stable, so we skip this test
-#ifndef Q_OS_WIN
-    QCOMPARE(results[0]["hash"].toString(), QString("dddddddddddddddddddddddddddddddddddddd"));
-#endif
-    QCOMPARE(results[0]["size"].toString(), QString("50"));
-}
-
-void TestManticoreQueries::testBulkInsertFeedAndCount()
-{
-    // Legacy test: insert 500 records into feed, verify count, then clean up
-    sphinxql_->exec("DELETE FROM feed WHERE id > 0");
-    
-    const int bulkCount = 500;
-    for (int i = 1; i <= bulkCount; i++) {
-        QVariantMap values;
-        values["id"] = static_cast<qint64>(i);
-        values["data"] = QString("{\"idx\":%1}").arg(i);
-        bool ok = sphinxql_->insertValues("feed", values);
-        QVERIFY2(ok, qPrintable(QString("Bulk insert feed item %1 failed: %2")
-                                .arg(i).arg(sphinxql_->lastError())));
+    const Torrent t = makeTorrent(3, "x"); // Debian torrent
+    QVERIFY(repo_->exists(t.hash));
+    QVERIFY(repo_->remove(t.hash));
+    // Removal should eventually be visible.
+    bool gone = false;
+    for (int i = 0; i < 50; ++i) {
+        if (!repo_->exists(t.hash)) {
+            gone = true;
+            break;
+        }
+        QThread::msleep(20);
     }
-    
-    // Verify count matches
-    qint64 count = sphinxql_->getCount("feed");
-    QCOMPARE(count, static_cast<qint64>(bulkCount));
-    
-    // Clean up
-    sphinxql_->exec("DELETE FROM feed WHERE id > 0");
-    qint64 countAfter = sphinxql_->getCount("feed");
-    QCOMPARE(countAfter, static_cast<qint64>(0));
+    QVERIFY2(gone, "Torrent should be removed");
 }
 
-void TestManticoreQueries::testInsertFeedJsonAndVerifyReadback()
+void TestManticoreQueries::testSelectQueryAgainstLiveIndex()
 {
-    // Legacy test: insert JSON object into feed, verify it reads back correctly
-    QJsonObject obj;
-    obj["a"] = 1;
-    obj["v"] = 2;
-    
-    QVariantMap values;
-    values["id"] = static_cast<qint64>(3);
-    values["data"] = QString::fromUtf8(QJsonDocument(obj).toJson(QJsonDocument::Compact));
-    
-    bool ok = sphinxql_->insertValues("feed", values);
-    QVERIFY2(ok, qPrintable("INSERT feed JSON failed: " + sphinxql_->lastError()));
-    
-    sphinxql_->flushRamchunk("feed");
-    
-    auto results = queryUntilFieldReady("SELECT * FROM feed WHERE id = 3", {}, "data");
-    QVERIFY2(!results.isEmpty(), "Should find inserted feed record");
-    
-    QString storedData = results[0]["data"].toString();
-    QVERIFY2(!storedData.isEmpty(), "data field should not be empty");
-    
-    QJsonDocument doc = QJsonDocument::fromJson(storedData.toUtf8());
-    QVERIFY(doc.isObject());
-    QCOMPARE(doc.object()["a"].toInt(), 1);
-    QCOMPARE(doc.object()["v"].toInt(), 2);
-    
-    // Clean up
-    sphinxql_->exec("DELETE FROM feed WHERE id > 0");
+    // Exercise the SelectQuery builder end-to-end against the live index.
+    const QString sql = SelectQuery("torrents")
+                            .columns("id, hash, name")
+                            .whereRaw("seeders > 0")
+                            .orderBy("seeders", true)
+                            .limit(0, 5)
+                            .build();
+    bool ok = false;
+    const auto rows = db_->query(sql, {}, &ok);
+    QVERIFY(ok);
+    // The Ubuntu torrent (111 seeders) guarantees at least one row.
+    QVERIFY(!rows.isEmpty());
+}
+
+// A full-index sweep (the `torrent.cleanup` maintenance path) must be able to
+// walk past Manticore's max_matches, which rejects any OFFSET >= 1000 with
+// "offset out of bounds" — the reason the filter cleanup used to stop after the
+// first 1000 torrents.
+void TestManticoreQueries::testPageAfterIdWalksPastMaxMatches()
+{
+    constexpr int kExtra = 1200;
+    const int base = 10000;
+    for (int i = 0; i < kExtra; ++i)
+        QVERIFY(repo_->add(makeTorrent(base + i, QString("Sweep Sample %1").arg(i))));
+    QVERIFY(waitForTorrent(makeTorrent(base + kExtra - 1, "x").hash));
+
+    // Plain OFFSET paging is what breaks: prove the limit is real, so this test
+    // fails loudly if the sweep ever goes back to offsets.
+    bool ok = false;
+    db_->query(SelectQuery("torrents").orderBy("id", false).limit(1000, 500).build(), {}, &ok);
+    QVERIFY2(!ok, "Manticore should reject an offset of 1000 (max_matches)");
+
+    int seen = 0;
+    qint64 afterId = 0;
+    qint64 previousId = 0;
+    for (;;) {
+        const QVector<Torrent> batch = repo_->pageAfterId(afterId, 500);
+        if (batch.isEmpty())
+            break;
+        for (const Torrent& t : batch) {
+            QVERIFY(t.id > previousId); // strictly ascending, no repeats
+            previousId = t.id;
+            ++seen;
+        }
+        afterId = batch.last().id;
+    }
+    QVERIFY2(seen >= kExtra, qPrintable(QString("swept %1 of >= %2 torrents").arg(seen).arg(kExtra)));
+    QCOMPARE(static_cast<qint64>(seen), repo_->statistics().torrents);
+}
+
+// ---------------------------------------------------------------------------
+// Row ids derived from the infohash
+// ---------------------------------------------------------------------------
+
+void TestManticoreQueries::testRowIdIsDerivedFromHash()
+{
+    const Torrent t = makeTorrent(770001, "Derived Id Sample");
+    QVERIFY(repo_->add(t));
+    QVERIFY(waitForTorrent(t.hash));
+
+    const auto stored = repo_->get(t.hash);
+    QVERIFY(stored.has_value());
+    // The row id is not a counter value: it is the hash, and a peer computing it
+    // from the same hash must arrive at the same number.
+    QCOMPARE(stored->id, rats::data::rowIdFromHash(t.hash));
+}
+
+void TestManticoreQueries::testFilesRowSharesTheTorrentId()
+{
+    Torrent t = makeTorrent(770002, "Shared Id Sample");
+    t.fileList = { File { "shared/one.mkv", 111 }, File { "shared/two.mkv", 222 } };
+    t.files = t.fileList.size();
+    QVERIFY(repo_->add(t));
+    QVERIFY(waitForTorrent(t.hash));
+    QVERIFY(waitForFiles(t.hash, 2));
+
+    // The files row carrying the torrent's own id is what turns the export join
+    // into a docid lookup, so assert the id itself rather than just the contents.
+    const qint64 expected = rats::data::rowIdFromHash(t.hash);
+    const auto rows = db_->query(QStringLiteral("SELECT id FROM files WHERE id = %1").arg(expected));
+    QCOMPARE(rows.size(), 1);
+
+    const QVector<File> files = repo_->filesOf(t.hash);
+    QCOMPARE(files.size(), 2);
+    QCOMPARE(files.at(0).path, QString("shared/one.mkv"));
+}
+
+void TestManticoreQueries::testReAddDoesNotDuplicateRow()
+{
+    // With a derived id, adding the same torrent twice targets one row, and the
+    // second add leaves the stored copy alone. Under the old counter the same
+    // sequence produced two rows carrying one hash.
+    Torrent t = makeTorrent(770003, "Duplicate Guard");
+    QVERIFY(repo_->add(t));
+    QVERIFY(waitForTorrent(t.hash));
+
+    t.name = "Duplicate Guard Reindexed";
+    QVERIFY(repo_->add(t));
+
+    const auto rows
+        = db_->query(QStringLiteral("SELECT id FROM torrents WHERE id = %1").arg(rats::data::rowIdFromHash(t.hash)));
+    QCOMPARE(rows.size(), 1);
+    QCOMPARE(repo_->get(t.hash)->name, QString("Duplicate Guard"));
+}
+
+void TestManticoreQueries::testRowIdCollisionIsRefused()
+{
+    // Two hashes that agree on their first 64 bits and differ afterwards map to
+    // one row. The second one must be refused, never stored over the first.
+    const QString shared = QStringLiteral("beefbeefbeefbeef");
+    Torrent first = makeTorrent(1, "Collision First");
+    first.hash = shared + QString(24, QLatin1Char('1'));
+    Torrent second = makeTorrent(2, "Collision Second");
+    second.hash = shared + QString(24, QLatin1Char('2'));
+    QCOMPARE(rats::data::rowIdFromHash(first.hash), rats::data::rowIdFromHash(second.hash));
+
+    QVERIFY(repo_->add(first));
+    QVERIFY(waitForTorrent(first.hash));
+
+    QVERIFY2(!repo_->add(second), "a torrent whose row id belongs to another must be refused");
+
+    // The original survives untouched, and the impostor is not findable.
+    const auto stored = repo_->get(first.hash);
+    QVERIFY(stored.has_value());
+    QCOMPARE(stored->name, QString("Collision First"));
+    QVERIFY(!repo_->get(second.hash).has_value());
+    QVERIFY(!repo_->exists(second.hash));
+
+    // Batch lookups must reach the same verdict, and report which hash lost.
+    QSet<QString> collided;
+    const auto found = repo_->getMany({ first.hash, second.hash }, &collided);
+    QVERIFY(found.contains(first.hash));
+    QVERIFY(!found.contains(second.hash));
+    QVERIFY(collided.contains(second.hash));
+}
+
+void TestManticoreQueries::testBatchRowIdCollisionIsRefused()
+{
+    // The collision add() catches needs a stored row to compare against. Two
+    // torrents that are both *new* to the index have none, so a batch write is the
+    // one path where nothing upstream can see the clash: getMany() finds neither,
+    // reports neither as collided, and both arrive here as "known absent".
+    const QString shared = QStringLiteral("cafecafecafecafe");
+    Torrent first = makeTorrent(1, "Batch Collision First");
+    first.hash = shared + QString(24, QLatin1Char('a'));
+    Torrent second = makeTorrent(2, "Batch Collision Second");
+    second.hash = shared + QString(24, QLatin1Char('b'));
+    QCOMPARE(rats::data::rowIdFromHash(first.hash), rats::data::rowIdFromHash(second.hash));
+    QVERIFY(!repo_->exists(first.hash));
+    QVERIFY(!repo_->exists(second.hash));
+
+    const auto before = repo_->statistics();
+    // One row written, not two: the count is the contract the statistics ride on.
+    QCOMPARE(repo_->addMany({ first, second }), 1);
+    QVERIFY(waitForTorrent(first.hash));
+
+    // The first one owns the row, whole and unmixed, and the loser stayed out.
+    const auto stored = repo_->get(first.hash);
+    QVERIFY(stored.has_value());
+    QCOMPARE(stored->name, QString("Batch Collision First"));
+    QVERIFY(!repo_->exists(second.hash));
+
+    // The statistics must describe the row that exists, not the rows handed in --
+    // an over-count here never heals, since nothing recomputes it until a restart.
+    QCOMPARE(repo_->statistics().torrents, before.torrents + 1);
+    QCOMPARE(repo_->statistics().files, before.files + first.files);
+    QCOMPARE(repo_->statistics().totalSize, before.totalSize + first.size);
+
+    // Re-priming from the index must agree with the counters kept in memory.
+    const auto inMemory = repo_->statistics();
+    repo_->primeFromDatabase();
+    QCOMPARE(repo_->statistics().torrents, inMemory.torrents);
+    QCOMPARE(repo_->statistics().totalSize, inMemory.totalSize);
+}
+
+// The same hash twice is not a collision: it is one torrent, and collapsing it is
+// ordinary dedupe rather than a refusal. Dump batches repeat hashes routinely.
+void TestManticoreQueries::testBatchDuplicateHashCollapsesToOneRow()
+{
+    Torrent t = makeTorrent(1, "Batch Duplicate");
+    const auto before = repo_->statistics();
+
+    QCOMPARE(repo_->addMany({ t, t }), 1);
+    QVERIFY(waitForTorrent(t.hash));
+
+    QCOMPARE(repo_->statistics().torrents, before.torrents + 1);
+    const auto stored = repo_->get(t.hash);
+    QVERIFY(stored.has_value());
+    QCOMPARE(stored->name, QString("Batch Duplicate"));
+}
+
+void TestManticoreQueries::testMigrationReKeysLegacyRows()
+{
+    // Write rows the way the pre-migration code did: a small sequential id that
+    // has nothing to do with the hash. The repository can no longer produce these,
+    // so they go in through the raw database layer.
+    struct Legacy {
+        qint64 id;
+        QString hash;
+        QString name;
+    };
+    const QVector<Legacy> legacy {
+        { 41, QStringLiteral("11110000") + QString(32, QLatin1Char('d')), QStringLiteral("Legacy One") },
+        { 42, QStringLiteral("22220000") + QString(32, QLatin1Char('d')), QStringLiteral("Legacy Two") },
+    };
+
+    for (const Legacy& row : legacy) {
+        QVERIFY(db_->insert("torrents",
+            QVariantMap { { "id", row.id }, { "hash", row.hash }, { "name", row.name }, { "nameIndex", row.name },
+                { "size", 4096 }, { "files", 1 }, { "piecelength", 262144 },
+                { "added", QDateTime::currentSecsSinceEpoch() }, { "ipv4", "10.0.0.1" }, { "port", 6881 },
+                { "contentType", 1 }, { "contentCategory", 0 }, { "seeders", 1 }, { "leechers", 1 }, { "completed", 1 },
+                { "trackersChecked", 0 }, { "good", 0 }, { "bad", 0 } }));
+        QVERIFY(db_->insert("files",
+            QVariantMap { { "id", row.id }, { "hash", row.hash }, { "path", "legacy/file.bin" }, { "size", "4096" } }));
+    }
+
+    // A legacy row is invisible to a lookup precisely because its id is wrong —
+    // that is what the migration exists to fix.
+    QVERIFY(!repo_->exists(legacy.first().hash));
+
+    for (const QString& table : { QStringLiteral("torrents"), QStringLiteral("files") }) {
+        qint64 cursor = 0;
+        for (;;) {
+            const auto page = repo_->migrateRowIdPage(table, cursor, 500);
+            // A failed page leaves the cursor where it was, so looping on
+            // `finished` alone would spin forever.
+            QVERIFY2(!page.failed, qPrintable("migration page failed on " + table));
+            if (page.finished)
+                break;
+        }
+    }
+
+    for (const Legacy& row : legacy) {
+        QVERIFY2(waitForTorrent(row.hash), qPrintable("not reachable after migration: " + row.name));
+        QVERIFY2(waitForFiles(row.hash, 1), qPrintable("files not reachable after migration: " + row.name));
+        const auto stored = repo_->get(row.hash, /*includeFiles*/ true);
+        QVERIFY(stored.has_value());
+        QCOMPARE(stored->name, row.name);
+        // Re-keyed, and the full-text column survived the rewrite.
+        QCOMPARE(stored->id, rats::data::rowIdFromHash(row.hash));
+        QCOMPARE(stored->fileList.size(), 1);
+        QCOMPARE(stored->fileList.at(0).path, QString("legacy/file.bin"));
+        // The old row is gone rather than left behind as a duplicate.
+        QVERIFY(db_->query(QStringLiteral("SELECT id FROM torrents WHERE id = %1").arg(row.id)).isEmpty());
+    }
+
+    TorrentRepository::SearchQuery q;
+    q.text = "Legacy One";
+    q.limit = 10;
+    QVERIFY2(!repo_->searchTorrents(q).isEmpty(), "re-keyed row must still be findable by name");
+
+    // Running it again must be a no-op, not a second rewrite.
+    qint64 cursor = 0;
+    int rewritten = 0;
+    for (;;) {
+        const auto page = repo_->migrateRowIdPage(QStringLiteral("torrents"), cursor, 500);
+        QVERIFY(!page.failed);
+        if (page.finished)
+            break;
+        rewritten += page.rewritten;
+    }
+    QCOMPARE(rewritten, 0);
+}
+
+void TestManticoreQueries::testUpdateAppliesAndKeepsSearchable()
+{
+    // update() used to be a partial UPDATE naming nameIndex, which Manticore
+    // rejects outright as a full-text field -- so nothing was written and vote
+    // merges vanished. Pin that it now actually applies.
+    Torrent t = makeTorrent(770004, "Updatable Sample zephyr");
+    t.good = 1;
+    QVERIFY(repo_->add(t));
+    QVERIFY(waitForTorrent(t.hash));
+
+    Torrent changed = *repo_->get(t.hash);
+    changed.good = 42;
+    changed.bad = 7;
+    changed.seeders = 999;
+    QVERIFY(repo_->update(changed));
+
+    const auto stored = repo_->get(t.hash);
+    QVERIFY(stored.has_value());
+    QCOMPARE(stored->good, 42);
+    QCOMPARE(stored->bad, 7);
+    QCOMPARE(stored->seeders, 999);
+    // Rewriting the row must not cost it its place in the full-text index, and
+    // must not leave a second row behind.
+    QCOMPARE(stored->id, rats::data::rowIdFromHash(t.hash));
+    TorrentRepository::SearchQuery q;
+    q.text = "zephyr";
+    q.limit = 10;
+    QCOMPARE(repo_->searchTorrents(q).size(), 1);
 }
 
 // ============================================================================
-// REPLACE operations
+// Whole-database export / import
 // ============================================================================
+//
+// These drive the real DatabaseExporter and DatabaseImporter against a live
+// index, which is the only place the two halves meet: the exporter's keyset
+// sweep, its file-list join and its background serialiser on one side, the
+// importer's batched merge through IndexingService on the other.
 
-void TestManticoreQueries::testReplaceIntoStore()
+void TestManticoreQueries::testExportImportRoundTrip()
 {
-    // Pattern from SphinxQL::replaceValues() - used for store table
-    QJsonObject data;
-    data["type"] = "vote";
-    data["vote"] = "bad";
-    
-    QVariantMap values;
-    values["id"] = static_cast<qint64>(1);
-    values["storeIndex"] = QString("vote:bbbb");
-    values["data"] = QString::fromUtf8(QJsonDocument(data).toJson(QJsonDocument::Compact));
-    values["hash"] = QString("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-    values["peerId"] = QString("peer456");
-    
-    bool ok = sphinxql_->replaceValues("store", values);
-    QVERIFY2(ok, qPrintable("REPLACE INTO store failed: " + sphinxql_->lastError()));
+    // A distinct hash space, so the rows the other tests left behind cannot make
+    // this one pass by accident.
+    const int kCount = 1200; // several frames, and past max_matches
+    QSet<QString> written;
+    QVector<Torrent> batch;
+    for (int i = 0; i < kCount; ++i) {
+        Torrent t = makeTorrent(500000 + i, QString("roundtrip subject %1").arg(i));
+        t.fileList = { File { QString("dir/file-%1.mkv").arg(i), 4096 + i } };
+        t.files = 1;
+        written.insert(t.hash);
+        batch.append(t);
+    }
+    QCOMPARE(repo_->addMany(batch), kCount);
+    QVERIFY(waitForTorrent(batch.last().hash));
+    QVERIFY(waitForFiles(batch.first().hash, 1));
+
+    const QString path = QDir(tempDir_->path()).absoluteFilePath("roundtrip.ratsdb");
+    rats::service::DatabaseExporter exporter(repo_);
+    rats::service::CancelToken noCancel;
+    qint64 lastReported = 0;
+    const auto result = exporter.run(
+        path, rats::service::dump::Header {}, noCancel, [&](qint64 torrents, qint64) { lastReported = torrents; });
+
+    QVERIFY2(result.ok, qPrintable(result.error));
+    QVERIFY(result.torrents >= kCount); // plus whatever earlier tests left in the index
+    QCOMPARE(lastReported, result.torrents);
+    QVERIFY(result.bytes > 0);
+    QCOMPARE(QFileInfo(path).size(), result.bytes);
+
+    // Read it straight back and confirm every hash we wrote came out again, with
+    // its file list intact — the join is a separate query from the page sweep, and
+    // losing it would be silent.
+    rats::service::DumpReader reader;
+    QString error;
+    QVERIFY2(reader.open(path, &error), qPrintable(error));
+    QSet<QString> seen;
+    int withFiles = 0;
+    QVector<Torrent> frame;
+    while (reader.readBatch(frame, &error)) {
+        for (const Torrent& t : frame) {
+            if (!written.contains(t.hash))
+                continue;
+            seen.insert(t.hash);
+            if (t.fileList.size() == 1)
+                ++withFiles;
+        }
+    }
+    QVERIFY(reader.atEnd());
+    QVERIFY2(reader.complete(), "a finished export must carry its end marker and footer");
+    QCOMPARE(seen.size(), kCount);
+    QCOMPARE(withFiles, kCount);
 }
 
-// ============================================================================
-// UPDATE operations
-// ============================================================================
-
-void TestManticoreQueries::testUpdateTorrentByHash()
+void TestManticoreQueries::testImportIsAMergeNotADuplicate()
 {
-    // Pattern from TorrentDatabase::updateTorrent()
-    QVariantMap values;
-    values["name"] = QString("Updated Torrent Name");
-    values["size"] = static_cast<qint64>(2048*1024);
-    values["files"] = 2;
-    values["contentType"] = 1;
-    values["contentCategory"] = 0;
-    values["seeders"] = 20;
-    values["leechers"] = 3;
-    values["completed"] = 150;
-    values["good"] = 5;
-    values["bad"] = 1;
-    
-    bool ok = sphinxql_->updateValues("torrents", values,
-                                       {{"hash", QString("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}});
-    QVERIFY2(ok, qPrintable("UPDATE torrent failed: " + sphinxql_->lastError()));
+    const int kCount = 40;
+    QVector<Torrent> batch;
+    for (int i = 0; i < kCount; ++i) {
+        Torrent t = makeTorrent(600000 + i, QString("merge subject %1").arg(i));
+        t.fileList = { File { QString("m/%1.bin").arg(i), 100 + i } };
+        t.files = 1;
+        batch.append(t);
+    }
+    QCOMPARE(repo_->addMany(batch), kCount);
+    QVERIFY(waitForTorrent(batch.last().hash));
+
+    const QString path = QDir(tempDir_->path()).absoluteFilePath("merge.ratsdb");
+    rats::service::DatabaseExporter exporter(repo_);
+    rats::service::CancelToken noCancel;
+    QVERIFY(exporter.run(path, rats::service::dump::Header {}, noCancel, {}).ok);
+
+    const qint64 before = repo_->statistics().torrents;
+
+    // Importing our own dump must add nothing: every row is already ours. This is
+    // the invariant that makes a dump merge idempotent, and it only holds because
+    // a row id is derived from the infohash rather than handed out by a counter.
+    rats::service::DatabaseImporter importer(indexing_);
+    rats::service::DatabaseImporter::Options options;
+    options.applyFilters = false;
+    const auto result = importer.run(path, options, noCancel, {});
+
+    QVERIFY2(result.ok, qPrintable(result.error));
+    QVERIFY(!result.truncated);
+    QCOMPARE(result.inserted, 0LL);
+    QVERIFY(result.merged >= kCount);
+    QCOMPARE(repo_->statistics().torrents, before);
 }
 
-void TestManticoreQueries::testUpdateTrackerInfo()
+void TestManticoreQueries::testCancelledExportLeavesNoFile()
 {
-    // Pattern from TorrentDatabase::updateTrackerInfo()
-    QVariantMap values;
-    values["seeders"] = 50;
-    values["leechers"] = 10;
-    values["completed"] = 200;
-    values["trackersChecked"] = QDateTime::currentSecsSinceEpoch();
-    
-    bool ok = sphinxql_->updateValues("torrents", values,
-                                       {{"hash", QString("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}});
-    QVERIFY2(ok, qPrintable("UPDATE tracker info failed: " + sphinxql_->lastError()));
+    const QString path = QDir(tempDir_->path()).absoluteFilePath("cancelled.ratsdb");
+    QFile::remove(path);
+
+    rats::service::CancelToken cancel;
+    cancel.cancel(); // already raised: the sweep must stop before writing anything
+
+    rats::service::DatabaseExporter exporter(repo_);
+    const auto result = exporter.run(path, rats::service::dump::Header {}, cancel, {});
+
+    QVERIFY(!result.ok);
+    // Cancellation is not a failure, so it reports no error — and it must not
+    // leave a file that looks like a dump but has no footer.
+    QVERIFY(result.error.isEmpty());
+    QVERIFY(!QFile::exists(path));
 }
 
-void TestManticoreQueries::testUpdateContentType()
+void TestManticoreQueries::testInterruptedImportResumesWhereItStopped()
 {
-    // Pattern from TorrentDatabase::updateTorrentContentType()
-    QVariantMap values;
-    values["contentType"] = 2;
-    values["contentCategory"] = 1;
-    
-    bool ok = sphinxql_->updateValues("torrents", values,
-                                       {{"hash", QString("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}});
-    QVERIFY2(ok, qPrintable("UPDATE content type failed: " + sphinxql_->lastError()));
-}
+    const int kCount = 1500; // at least three frames
+    QVector<Torrent> batch;
+    for (int i = 0; i < kCount; ++i)
+        batch.append(makeTorrent(700000 + i, QString("resume subject %1").arg(i)));
+    QCOMPARE(repo_->addMany(batch), kCount);
+    QVERIFY(waitForTorrent(batch.last().hash));
 
-void TestManticoreQueries::testUpdateInfoField()
-{
-    // Pattern from TorrentDatabase::updateTorrentInfoField() - JSON info update
-    QJsonObject info;
-    info["trackers"] = QJsonArray({"udp://tracker1.com:6969", "udp://tracker2.com:6969"});
-    info["source"] = "manual";
-    
-    QVariantMap values;
-    values["info"] = QString::fromUtf8(QJsonDocument(info).toJson(QJsonDocument::Compact));
-    
-    bool ok = sphinxql_->updateValues("torrents", values,
-                                       {{"hash", QString("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}});
-    QVERIFY2(ok, qPrintable("UPDATE info field failed: " + sphinxql_->lastError()));
-    
-    // Verify the JSON was stored correctly
-    auto results = queryUntilFieldReady("SELECT info FROM torrents WHERE hash = ?",
-                                    {QString("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")},
-                                    "info");
-    QVERIFY(!results.isEmpty());
-    QString storedInfo = results[0]["info"].toString();
-    QVERIFY(!storedInfo.isEmpty());
-    QJsonDocument doc = QJsonDocument::fromJson(storedInfo.toUtf8());
-    QVERIFY(doc.isObject());
-    QVERIFY(doc.object().contains("trackers"));
-}
+    const QString path = QDir(tempDir_->path()).absoluteFilePath("resume.ratsdb");
+    rats::service::DatabaseExporter exporter(repo_);
+    rats::service::CancelToken noCancel;
+    const auto exported = exporter.run(path, rats::service::dump::Header {}, noCancel, {});
+    QVERIFY(exported.ok);
 
-// ============================================================================
-// DELETE operations
-// ============================================================================
+    // Stop after the first committed frame and keep the offset it reported.
+    rats::service::CancelToken cancel;
+    qint64 resumeOffset = 0;
+    qint64 firstPass = 0;
+    rats::service::DatabaseImporter importer(indexing_);
+    rats::service::DatabaseImporter::Options options;
+    options.applyFilters = false;
+    const auto partial
+        = importer.run(path, options, cancel, [&](const rats::service::DatabaseImporter::Result& progress) {
+              resumeOffset = progress.offset;
+              firstPass = progress.processed;
+              cancel.cancel();
+          });
 
-void TestManticoreQueries::testDeleteTorrentByHash()
-{
-    // Insert a second torrent for deletion test
-    insertTestTorrent(2, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "Delete Me Torrent");
-    
-    // Pattern from TorrentDatabase::removeTorrent()
-    bool ok = sphinxql_->deleteFrom("torrents",
-                                     {{"hash", QString("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")}});
-    QVERIFY2(ok, qPrintable("DELETE torrent failed: " + sphinxql_->lastError()));
-    
-    // Verify deletion
-    auto results = sphinxql_->query("SELECT id FROM torrents WHERE hash = ?",
-                                    {QString("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")});
-    QCOMPARE(results.size(), 0);
-}
+    QVERIFY(partial.cancelled);
+    QVERIFY(!partial.ok);
+    QVERIFY(firstPass > 0);
+    QVERIFY(resumeOffset > 0);
+    QVERIFY(resumeOffset < QFileInfo(path).size());
 
-void TestManticoreQueries::testDeleteFilesByHash()
-{
-    // Insert files for deletion test
-    insertTestFiles(2, "cccccccccccccccccccccccccccccccccccccccc", "test.txt", "100");
-    
-    // Pattern from TorrentDatabase::addFilesToDatabase() - delete before re-insert
-    bool ok = sphinxql_->deleteFrom("files",
-                                     {{"hash", QString("cccccccccccccccccccccccccccccccccccccccc")}});
-    QVERIFY2(ok, qPrintable("DELETE files failed: " + sphinxql_->lastError()));
-}
-
-void TestManticoreQueries::testDeleteFeedAll()
-{
-    // Pattern from FeedManager::save() and FeedManager::clear()
-    bool ok = sphinxql_->exec("DELETE FROM feed WHERE id > 0");
-    QVERIFY2(ok, qPrintable("DELETE feed all failed: " + sphinxql_->lastError()));
-}
-
-// ============================================================================
-// Maintenance operations
-// ============================================================================
-
-void TestManticoreQueries::testOptimizeIndex()
-{
-    // Pattern from SphinxQL::optimize()
-    bool ok = sphinxql_->exec("OPTIMIZE INDEX torrents");
-    QVERIFY2(ok, qPrintable("OPTIMIZE INDEX torrents failed: " + sphinxql_->lastError()));
-    
-    ok = sphinxql_->exec("OPTIMIZE INDEX files");
-    QVERIFY2(ok, qPrintable("OPTIMIZE INDEX files failed: " + sphinxql_->lastError()));
-}
-
-void TestManticoreQueries::testFlushRamchunk()
-{
-    // Pattern from SphinxQL::flushRamchunk()
-    bool ok = sphinxql_->exec("FLUSH RAMCHUNK torrents");
-    QVERIFY2(ok, qPrintable("FLUSH RAMCHUNK torrents failed: " + sphinxql_->lastError()));
-}
-
-void TestManticoreQueries::testTruncateTable()
-{
-    // Pattern from MigrationManager - clearing feed table
-    // Use a non-critical table for testing
-    bool ok = sphinxql_->exec("TRUNCATE TABLE version");
-    QVERIFY2(ok, qPrintable("TRUNCATE TABLE failed: " + sphinxql_->lastError()));
-}
-
-// ============================================================================
-// SphinxQL helper methods
-// ============================================================================
-
-void TestManticoreQueries::testInsertValues()
-{
-    // Test the insertValues() high-level method
-    QVariantMap values;
-    values["id"] = static_cast<qint64>(10);
-    values["version"] = 2;
-    values["versionIndex"] = QString("v2");
-    
-    bool ok = sphinxql_->insertValues("version", values);
-    QVERIFY2(ok, qPrintable("insertValues failed: " + sphinxql_->lastError()));
-}
-
-void TestManticoreQueries::testReplaceValues()
-{
-    // Test the replaceValues() high-level method
-    QVariantMap values;
-    values["id"] = static_cast<qint64>(10);
-    values["version"] = 3;
-    values["versionIndex"] = QString("v3");
-    
-    bool ok = sphinxql_->replaceValues("version", values);
-    QVERIFY2(ok, qPrintable("replaceValues failed: " + sphinxql_->lastError()));
-}
-
-void TestManticoreQueries::testUpdateValues()
-{
-    // Test the updateValues() high-level method
-    QVariantMap setValues;
-    setValues["seeders"] = 99;
-    
-    QVariantMap where;
-    where["hash"] = QString("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    
-    bool ok = sphinxql_->updateValues("torrents", setValues, where);
-    QVERIFY2(ok, qPrintable("updateValues failed: " + sphinxql_->lastError()));
-    
-    // Verify
-    auto results = sphinxql_->query("SELECT seeders FROM torrents WHERE hash = ?",
-                                    {QString("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")});
-    QVERIFY(!results.isEmpty());
-}
-
-void TestManticoreQueries::testDeleteFrom()
-{
-    // Insert and delete
-    QVariantMap insValues;
-    insValues["id"] = static_cast<qint64>(20);
-    insValues["version"] = 99;
-    insValues["versionIndex"] = QString("v99");
-    sphinxql_->insertValues("version", insValues);
-    
-    bool ok = sphinxql_->deleteFrom("version", {{"id", static_cast<qint64>(20)}});
-    QVERIFY2(ok, qPrintable("deleteFrom failed: " + sphinxql_->lastError()));
-}
-
-void TestManticoreQueries::testGetMaxId()
-{
-    // Test getMaxId() helper
-    qint64 maxId = sphinxql_->getMaxId("torrents");
-    QVERIFY(maxId >= 1);
-}
-
-void TestManticoreQueries::testGetCount()
-{
-    // Test getCount() helper
-    qint64 count = sphinxql_->getCount("torrents");
-    QVERIFY(count >= 1);
-    
-    // With WHERE clause
-    qint64 countFiltered = sphinxql_->getCount("torrents", "seeders > 0");
-    QVERIFY(countFiltered >= 0);
+    // Resuming reads only what is left. The offset is recorded after the batch it
+    // follows is committed, so a resume may repeat work but must never skip it —
+    // the two passes together have to cover the whole dump.
+    options.startOffset = resumeOffset;
+    const auto rest = importer.run(path, options, noCancel, {});
+    QVERIFY2(rest.ok, qPrintable(rest.error));
+    QVERIFY(rest.processed > 0);
+    QVERIFY(rest.processed < exported.torrents);
+    QVERIFY(firstPass + rest.processed >= exported.torrents);
 }
 
 QTEST_MAIN(TestManticoreQueries)

@@ -20,6 +20,7 @@ A high-performance BitTorrent search program for desktop and server. It collects
 * Collection filters (regex filters, adult filters)
 * Tracker peers scan support
 * Collects only statistical information and doesn't save any internal torrent data
+* Database export/import: dump the whole index to a portable `.ratsdb` file and merge it back (resumable)
 
 ### P2P Network & Security
 * Supports its own P2P protocol for additional data transfer (search between Rats clients, descriptions/votes transfer, etc.)
@@ -29,6 +30,7 @@ A high-performance BitTorrent search program for desktop and server. It collects
 * mDNS Discovery for automatic local network peer discovery
 * NAT Traversal with STUN/ICE support for connecting through firewalls
 * GossipSub messaging for scalable publish-subscribe protocol
+* Database transfer between clients: download a peer's whole index over P2P (opt-in sharing on the serving side)
 * Supports torrent rating (voting)
 * Description association from trackers
 * Top list (most common and popular torrents)
@@ -43,7 +45,7 @@ A high-performance BitTorrent search program for desktop and server. It collects
 * Native C++/Qt application — fast, responsive, and lightweight
 * Modern dark UI with customizable settings
 * System tray support with minimize/close to tray
-* Translations: English, Russian, Ukrainian, Chinese, Spanish, French, German, Japanese, Portuguese, Italian, Hindi
+* Translations: English, Russian, Japanese, Chinese, Korean, German, Spanish, French
 * Console mode for headless server operation
 * REST & WebSocket API for custom clients and integrations
 
@@ -149,27 +151,18 @@ Console mode options:
 | `-p, --port <port>` | P2P listen port (overrides config setting) |
 | `-d, --dht-port <port>` | DHT port (overrides config setting) |
 | `--data-dir <path>` | Data directory for database and config |
-| `-s, --spider` | Enable torrent spider (disabled by default in console mode) |
+| `-s, --spider` | Force-enable the DHT spider even when `indexer` is off in the config |
 | `-m, --max-peers <n>` | Maximum P2P connections (overrides config, range: 10-1000) |
 
-Interactive commands in console mode:
+Console mode runs unattended: it starts every subsystem, logs to
+`<data-dir>/rats-search.log`, and exits on `Ctrl+C`. It reads no commands from
+stdin — to query or drive a running instance, enable the REST API
+(`"restApi": true`) and use the [HTTP/WebSocket API](docs/API.md).
 
-| Command | Description |
-|---------|-------------|
-| `stats` | Show statistics (torrents, files, peers, DHT nodes) |
-| `search <query>` | Search torrents by name |
-| `recent [n]` | Show n recent torrents (default: 10) |
-| `top [type]` | Show top torrents by type |
-| `spider start` | Start the DHT spider |
-| `spider stop` | Stop the DHT spider |
-| `peers [n]` | Show or set max P2P connections (10-1000) |
-| `help` | Show available commands |
-| `quit` / `exit` | Exit the application |
-
-Example console session:
+Example:
 
 ```bash
-# Start with spider enabled
+# Start with the spider forced on
 ./RatsSearch --console --spider --data-dir /var/lib/rats-search
 
 # Or start with custom ports
@@ -185,8 +178,8 @@ After first launch, a configuration file `rats.json` will be created in the data
     "p2pPort": 4445,
     "dhtPort": 4446,
     "httpPort": 8095,
-    "restApiEnabled": true,
-    "indexerEnabled": true,
+    "restApi": true,
+    "indexer": true,
     "darkMode": true
 }
 ```
@@ -195,9 +188,13 @@ After first launch, a configuration file `rats.json` will be created in the data
 |---------|-------------|
 | `p2pPort` | Port for P2P communication (TCP/UDP) |
 | `dhtPort` | Port for DHT operations (UDP) |
-| `httpPort` | Port for REST API server |
-| `restApiEnabled` | Enable/disable REST API |
-| `indexerEnabled` | Enable/disable DHT indexer |
+| `httpPort` | Port for REST API server (WebSocket listens on `httpPort + 1`) |
+| `restApi` | Enable/disable REST API |
+| `indexer` | Enable/disable DHT indexer |
+| `upnp` | Enable/disable UPnP/NAT-PMP port mapping (config-file only) |
+| `holePunch` | Enable/disable NAT hole punching, the fallback for networks where port mapping fails; also relays other peers' rendezvous (config-file only) |
+| `relay` | Enable/disable relayed circuits — reaching a peer through a third node both ends already hold, the fallback for peers no punch can reach (config-file only) |
+| `relayServe` | Carry *other* peers' relayed circuits. Off by default: it spends real uplink on somebody else's traffic (config-file only) |
 
 ## API
 
@@ -265,7 +262,7 @@ Access the web interface at: http://localhost:8095
 
 ## Support & Donation
 
-Bitcoin: bc1qsm5akf0gf2jnnxvjpf6nn3cd2p29yt3svxva3g
+Bitcoin: bc1pmzppgyj3qlveeqzpuza3j079wjskdf56nk7f2pd7mqc6fl53yr8su93kpx
 
 Subscribe to autor (GitHub donations): https://github.com/sponsors/DEgITx
 
